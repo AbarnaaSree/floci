@@ -39,7 +39,8 @@ class CloudFormationFirehoseIntegrationTest {
                         "S3DestinationConfiguration": {
                           "BucketARN": "arn:aws:s3:::my-firehose-bucket",
                           "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
-                          "Prefix": "logs/"
+                          "Prefix": "logs/",
+                          "CompressionFormat": "GZIP"
                         }
                       }
                     }
