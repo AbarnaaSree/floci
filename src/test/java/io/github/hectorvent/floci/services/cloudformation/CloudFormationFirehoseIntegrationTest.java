@@ -88,5 +88,6 @@ class CloudFormationFirehoseIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString(streamName));
+            .body(containsString("GZIP"))
     }
 }
