@@ -812,6 +812,8 @@ public class CloudFormationService {
                     if ("CREATE_FAILED".equals(resource.getStatus())
                             || "UPDATE_FAILED".equals(resource.getStatus())) {
                         failedResource = resource;
+
+
                         if (!isCreate && previousResource != null) {
                             // Provisioners work on a copy of the stored resource metadata. Keep the
                             // last known-good identity and status when an update attempt fails so a
