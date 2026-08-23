@@ -113,7 +113,19 @@ public class CloudFormationService {
     }
 
     private void persistStack(Stack stack) {
-        stackBackend.putForAccount(storageAccount, key(stack.getStackName(), stack.getRegion()), stack);
+        stackBackend.putForAccount(
+                storageAccount,
+                key(stack.getStackName(), stack.getRegion()),
+                stack);
+    }
+
+    private void persistStackIfCurrent(Stack stack) {
+        synchronized (getStackLock(stack.getStackName(), stack.getRegion())) {
+            String stackKey = key(stack.getStackName(), stack.getRegion());
+            if (stacks.get(stackKey) == stack) {
+                persistStack(stack);
+            }
+        }
     }
 
     private void unpersistStack(String stackName, String region) {
@@ -1418,8 +1430,10 @@ public class CloudFormationService {
                 if (skipRetainedResource(stack, resource, false)) {
                     continue;
                 }
+
                 addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                         resource.getResourceType(), "DELETE_IN_PROGRESS", null);
+
                 try {
                     deleteResourcePhysically(resource, region);
                     resource.setStatus("DELETE_COMPLETE");
@@ -1441,34 +1455,36 @@ public class CloudFormationService {
                 }
             }
 
-            if (!failedResources.isEmpty()) {
-                String reason = "The following resource(s) failed to delete: ["
-                        + String.join(", ", failedResources) + "].";
-                stack.setStatus("DELETE_FAILED");
-                stack.setStatusReason(reason);
+            synchronized (getStackLock(stack.getStackName(), region)) {
+                if (!failedResources.isEmpty()) {
+                    String reason = "The following resource(s) failed to delete: ["
+                            + String.join(", ", failedResources) + "].";
+                    stack.setStatus("DELETE_FAILED");
+                    stack.setStatusReason(reason);
+                    addEvent(stack, stack.getStackName(), stack.getStackId(),
+                            "AWS::CloudFormation::Stack", "DELETE_FAILED", reason);
+                    persistStack(stack);
+                    LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), reason);
+                    throw new IllegalStateException(reason);
+                }
+
+                stack.setStatus("DELETE_COMPLETE");
                 addEvent(stack, stack.getStackName(), stack.getStackId(),
-                        "AWS::CloudFormation::Stack", "DELETE_FAILED", reason);
-                persistStack(stack);
-                LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), reason);
-                throw new IllegalStateException(reason);
+                        "AWS::CloudFormation::Stack", "DELETE_COMPLETE", null);
+                removeStackExports(stack, region);
+                stacks.remove(key(stack.getStackName(), region));
+                unpersistStack(stack.getStackName(), region);
+                deletedStacks.put(stack.getStackId(), new DeletedStackEntry(
+                        stack,
+                        now().plusSeconds(
+                                config.services().cloudformation().deletedStackRetentionSeconds())));
+                LOG.infov("Stack {0} deleted", stack.getStackName());
             }
-
-            stack.setStatus("DELETE_COMPLETE");
-            addEvent(stack, stack.getStackName(), stack.getStackId(),
-                    "AWS::CloudFormation::Stack", "DELETE_COMPLETE", null);
-            removeStackExports(stack, region);
-            stacks.remove(key(stack.getStackName(), region));
-            unpersistStack(stack.getStackName(), region);
-            deletedStacks.put(stack.getStackId(), new DeletedStackEntry(
-                    stack,
-                    now().plusSeconds(config.services().cloudformation().deletedStackRetentionSeconds())));
-            LOG.infov("Stack {0} deleted", stack.getStackName());
-
         } catch (Exception e) {
             LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), e.getMessage());
             stack.setStatus("DELETE_FAILED");
             stack.setStatusReason(e.getMessage());
-            persistStack(stack);
+            persistStackIfCurrent(stack);
             throw (e instanceof RuntimeException re ? re : new RuntimeException(e));
         }
     }
