@@ -883,7 +883,7 @@ public class CloudFormationService {
                             "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS", null);
                     // The committed template and new physical IDs must be durable before old
                     // resources are deleted during post-update cleanup.
-                    persistStack(stack);
+                    persistStackIfCurrent(stack);
                 }
                 // Both cleanup paths feed the single final status/reason writer.
                 List<UpdateCleanupFailure> cleanupFailures =
@@ -898,7 +898,7 @@ public class CloudFormationService {
             stack.setLastUpdatedTime(now());
             addEvent(stack, stack.getStackName(), stack.getStackId(),
                     "AWS::CloudFormation::Stack", "CREATE_COMPLETE", null);
-            persistStack(stack);
+            persistStackIfCurrent(stack);
             LOG.infov("Stack {0} execution complete: CREATE_COMPLETE", stack.getStackName());
 
         } catch (Exception e) {
@@ -912,7 +912,7 @@ public class CloudFormationService {
                 addEvent(stack, stack.getStackName(), stack.getStackId(),
                         "AWS::CloudFormation::Stack",
                         "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS", e.getMessage());
-                persistStack(stack);
+                persistStackIfCurrent(stack);
                 return;
             }
             LOG.errorv("Stack {0} execution failed: {1}", stack.getStackName(), e.getMessage());
@@ -922,7 +922,7 @@ public class CloudFormationService {
             addEvent(stack, stack.getStackName(), stack.getStackId(),
                     "AWS::CloudFormation::Stack", failStatus, e.getMessage());
             if (isCreate) {
-                persistStack(stack);
+                persistStackIfCurrent(stack);
             } else {
                 rollbackFailedUpdate(
                         stack, region, previousState, attemptedResourceIds, e.getMessage());
@@ -977,7 +977,7 @@ public class CloudFormationService {
                     failedResource.getStatusReason());
             return;
         }
-        persistStack(stack);
+        persistStackIfCurrent(stack);
     }
 
     private List<UpdateCleanupFailure> finishCommittedResourceCleanup(Stack stack) {
@@ -1051,7 +1051,7 @@ public class CloudFormationService {
         stack.setLastUpdatedTime(now());
         addEvent(stack, stack.getStackName(), stack.getStackId(),
                 "AWS::CloudFormation::Stack", "UPDATE_COMPLETE", statusReason);
-        persistStack(stack);
+        persistStackIfCurrent(stack);
         LOG.infov("Stack {0} execution complete: UPDATE_COMPLETE", stack.getStackName());
     }
 
@@ -1146,7 +1146,7 @@ public class CloudFormationService {
                     "AWS::CloudFormation::Stack", "UPDATE_ROLLBACK_FAILED", reason);
             LOG.errorv("Stack {0} update rollback failed: {1}", stack.getStackName(), reason);
         }
-        persistStack(stack);
+        persistStackIfCurrent(stack);
     }
 
     private List<String> rollbackUpdatedResources(
