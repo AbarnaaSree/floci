@@ -125,23 +125,28 @@ public class CloudFormationService {
      * Returns the stack so the caller can echo its {@code StackId}.
      */
     public Stack updateTerminationProtection(String stackName, boolean enabled, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
-        stack.setEnableTerminationProtection(enabled);
-        persistStack(stack);
-        return stack;
+        synchronized (getStackLock(stackName, region)) {
+            Stack stack = getStackOrThrow(stackName, region);
+            stack.setEnableTerminationProtection(enabled);
+            persistStack(stack);
+            return stack;
+        }
     }
 
     // ── DescribeStacks ────────────────────────────────────────────────────────
 
     public List<Stack> describeStacks(String stackName, String region) {
         if (stackName != null && !stackName.isBlank()) {
-            Stack stack = resolveStackForDescribe(stackName, region);
-            if (stack == null) {
-                throw new AwsException("ValidationError",
-                        "Stack with id " + stackName + " does not exist", 400);
+            synchronized (getStackLock(stackName, region)) {
+                Stack stack = resolveStackForDescribe(stackName, region);
+                if (stack == null) {
+                    throw new AwsException("ValidationError",
+                            "Stack with id " + stackName + " does not exist", 400);
+                }
+                return List.of(stack);
             }
-            return List.of(stack);
         }
+
         return stacks.values().stream()
                 .filter(s -> region.equals(s.getRegion()))
                 .sorted(Comparator.comparing(Stack::getCreationTime))
@@ -237,34 +242,40 @@ public class CloudFormationService {
         // stack - two UPDATE change sets on a live stack, or two CREATE change sets attaching to the
         // same REVIEW_IN_PROGRESS placeholder - would otherwise both write it after the per-key lock
         // was already released, losing an accepted change set or corrupting the map's links. Only
-        // persistStack() stays outside: it is storage I/O, and compute()'s contract is that the
-        // remapping function does short, non-blocking work.
+        // The change-set mutation and persistence are kept inside the same per-stack lock so
+        // DeleteChangeSet/DeleteStack cannot race with creation and overwrite or resurrect state.
         boolean isCreateType = changeSetType == null || "CREATE".equalsIgnoreCase(changeSetType);
         ChangeSet[] created = new ChangeSet[1];
-        Stack stack = stacks.compute(key(stackName, region), (k, existing) -> {
+
+        Stack stack;
+        synchronized (getStackLock(stackName, region)) {
+            stack = stacks.get(key(stackName, region));
+
             Stack target;
-            if (existing == null) {
+            if (stack == null) {
                 target = newStack(stackName, region);
-                if (tags != null) target.getTags().putAll(tags);
-                // A CREATE change set puts a brand-new stack into REVIEW_IN_PROGRESS. Record the
-                // matching stack-level event (as AWS and LocalStack do) so DescribeStackEvents is
-                // non-empty straight after change-set creation — tooling such as the AWS SAM CLI
-                // reads StackEvents[0] there and otherwise fails with an IndexError.
-                // (CreateChangeSet defaults a null type to CREATE.)
+                if (tags != null) {
+                    target.getTags().putAll(tags);
+                }
+
                 if (isCreateType) {
                     addEvent(target, target.getStackName(), target.getStackId(),
                             "AWS::CloudFormation::Stack", "REVIEW_IN_PROGRESS", "User Initiated");
                 }
+
+                stacks.put(key(stackName, region), target);
             } else {
                 boolean reusableReviewPlaceholder =
-                        attachToReviewInProgressStack && "REVIEW_IN_PROGRESS".equals(existing.getStatus());
+                        attachToReviewInProgressStack
+                                && "REVIEW_IN_PROGRESS".equals(stack.getStatus());
+
                 if (isCreateType && !reusableReviewPlaceholder) {
                     throw new AwsException("AlreadyExistsException",
                             "Stack [" + stackName + "] already exists", 400);
                 }
-                target = existing;
-            }
 
+                target = stack;
+            }
             ChangeSet cs = new ChangeSet();
             cs.setChangeSetId(AwsArnUtils.Arn.of("cloudformation", region, regionResolver.getAccountId(), "changeSet/" + changeSetName + "/" + UUID.randomUUID()).toString());
             cs.setChangeSetName(changeSetName);
@@ -278,23 +289,24 @@ public class CloudFormationService {
             cs.setExecutionStatus("AVAILABLE");
             target.getChangeSets().put(changeSetName, cs);
             created[0] = cs;
-            return target;
-        });
-
-        persistStack(stack);
+            stack = target;
+            persistStack(stack);
+        }
         return created[0];
     }
 
     // ── DescribeChangeSet ─────────────────────────────────────────────────────
 
     public ChangeSet describeChangeSet(String stackName, String changeSetName, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
-        ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName));
-        if (cs == null) {
-            throw new AwsException("ChangeSetNotFoundException",
-                    "ChangeSet [" + changeSetName + "] does not exist", 400);
+        synchronized (getStackLock(stackName, region)) {
+            Stack stack = getStackOrThrow(stackName, region);
+            ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName));
+            if (cs == null) {
+                throw new AwsException("ChangeSetNotFoundException",
+                        "ChangeSet [" + changeSetName + "] does not exist", 400);
+            }
+            return cs;
         }
-        return cs;
     }
 
     // ── ExecuteChangeSet ──────────────────────────────────────────────────────
@@ -311,10 +323,13 @@ public class CloudFormationService {
      * are materialized under a synthetic request scope bound to {@code accountId} so a single-stack
      * deployment lands in the caller's account, and a StackSet instance lands in its target account.
      */
-    public Future<?> executeChangeSet(String stackName, String changeSetName, String region, String accountId) {
-        Stack stack = getStackOrThrow(stackName, region);
-
+    public Future<?> executeChangeSet(String stackName, String changeSetName,
+                                  String region, String accountId) {
         synchronized (getStackLock(stackName, region)) {
+            // Re-resolve after acquiring the lock so we never operate on
+            // a stack that DeleteStack removed while we were waiting.
+            Stack stack = getStackOrThrow(stackName, region);
+
             ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName));
             if (cs == null) {
                 throw new AwsException("ChangeSetNotFoundException",
@@ -337,9 +352,7 @@ public class CloudFormationService {
                     cs.getParameters() != null ? cs.getParameters() : Map.of();
 
             return executor.submit(() -> runUnderAccount(accountId, () -> {
-                synchronized (getStackLock(stack.getStackName(), region)) {
-                    executeTemplate(stack, templateBody, params, isCreate, region, accountId);
-                }
+                executeTemplate(stack, templateBody, params, isCreate, region, accountId);
             }));
         }
     }
@@ -376,9 +389,9 @@ public class CloudFormationService {
     // ── DeleteChangeSet ───────────────────────────────────────────────────────
 
     public void deleteChangeSet(String stackName, String changeSetName, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
-
         synchronized (getStackLock(stackName, region)) {
+            Stack stack = getStackOrThrow(stackName, region);
+
             String name = resolveChangeSetName(changeSetName);
             ChangeSet cs = stack.getChangeSets().get(name);
 
@@ -439,9 +452,7 @@ public class CloudFormationService {
             Stack stackToDelete = stack;
 
             return executor.submit(() -> runUnderAccount(accountId, () -> {
-                synchronized (getStackLock(stackToDelete.getStackName(), region)) {
-                    deleteStackResources(stackToDelete, region);
-                }
+                deleteStackResources(stackToDelete, region);
             }));
         }
     }
@@ -666,13 +677,19 @@ public class CloudFormationService {
     }
 
     private void executeTemplate(Stack stack, String templateBody, Map<String, String> params,
-                                 boolean isCreate, String region, String accountId) {
-        StackUpdateSnapshot previousState = snapshotForUpdate(stack);
+                             boolean isCreate, String region, String accountId) {
+        StackUpdateSnapshot previousState;
+
+        synchronized (getStackLock(stack.getStackName(), region)) {
+            previousState = snapshotForUpdate(stack);
+        }
         boolean updateCommitted = false;
         Set<String> attemptedResourceIds = new LinkedHashSet<>();
         try {
             JsonNode template = parseTemplate(templateBody);
-            stack.setOriginalTemplateBody(templateBody);
+            synchronized (getStackLock(stack.getStackName(), region)) {
+                stack.setOriginalTemplateBody(templateBody);
+            }
 
             // Apply SAM transform if the template declares AWS::Serverless-2016-10-31
             if (samTransformProcessor.hasSamTransform(template)) {
@@ -682,7 +699,9 @@ public class CloudFormationService {
                 templateBody = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(template);
             }
 
-            stack.setTemplateBody(templateBody);
+            synchronized (getStackLock(stack.getStackName(), region)) {
+                stack.setTemplateBody(templateBody);
+            }
 
             // Merge default parameter values from the template with caller-supplied params
             Map<String, String> resolvedParams = resolveDefaultParameters(template, params);
@@ -722,15 +741,20 @@ public class CloudFormationService {
                             stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper,
                             name -> exports.get(exportKey(region, name)));
 
-                    StackResource resource = stack.getResources().get(logicalId);
+                    StackResource resource;
+                    synchronized (getStackLock(stack.getStackName(), region)) {
+                        resource = stack.getResources().get(logicalId);
+                    }
                     StackResource previousResource = resource;
                     if (resource == null) {
                         resource = new StackResource();
                         resource.setLogicalId(logicalId);
                         resource.setResourceType(type);
-                        stack.getResources().put(logicalId, resource);
-                    }
 
+                        synchronized (getStackLock(stack.getStackName(), region)) {
+                            stack.getResources().put(logicalId, resource);
+                        }
+                    }
                     String inProgressStatus = isCreate
                             ? "CREATE_IN_PROGRESS"
                             : "UPDATE_IN_PROGRESS";
@@ -763,11 +787,13 @@ public class CloudFormationService {
                     // Both branches return a fresh StackResource, so the policy is carried over here
                     // rather than on the instance the loop started with.
                     resource.setDeletionPolicy(deletionPolicy);
-                    stack.getResources().put(logicalId, resource);
+
+                    synchronized (getStackLock(stack.getStackName(), region)) {
+                        stack.getResources().put(logicalId, resource);
+                    }
 
                     physicalIds.put(logicalId, resource.getPhysicalId());
                     resourceAttrs.put(logicalId, resource.getAttributes());
-
                     addEvent(stack, logicalId, resource.getPhysicalId(), type,
                             resource.getStatus(), resource.getStatusReason());
 
@@ -784,7 +810,10 @@ public class CloudFormationService {
                             previousResource.getAttributes().put(
                                     CloudFormationResourceProvisioner.UPDATE_ROLLBACK_RESTORED_ATTR,
                                     "true");
-                            stack.getResources().put(logicalId, previousResource);
+
+                            synchronized (getStackLock(stack.getStackName(), region)) {
+                                stack.getResources().put(logicalId, previousResource);
+                            }
                         }
                         break;
                     }
@@ -1331,8 +1360,11 @@ public class CloudFormationService {
                 }
             }
 
+
             if (resource.getPhysicalId() == null || skipRetainedResource(stack, resource, false)) {
-                stack.getResources().remove(resource.getLogicalId());
+                synchronized (getStackLock(stack.getStackName(), region)) {
+                    stack.getResources().remove(resource.getLogicalId());
+                }
                 continue;
             }
 
@@ -1342,7 +1374,9 @@ public class CloudFormationService {
                 deleteResourcePhysically(resource, region);
                 addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                         resource.getResourceType(), "DELETE_COMPLETE", null);
-                stack.getResources().remove(resource.getLogicalId());
+                synchronized (getStackLock(stack.getStackName(), region)) {
+                    stack.getResources().remove(resource.getLogicalId());
+                }
             } catch (Exception e) {
                 String reason = e.getMessage() != null
                         ? e.getMessage()
@@ -1739,7 +1773,10 @@ public class CloudFormationService {
         event.setResourceType(resourceType);
         event.setResourceStatus(status);
         event.setResourceStatusReason(reason);
-        stack.getEvents().add(event);
+
+        synchronized (getStackLock(stack.getStackName(), stack.getRegion())) {
+            stack.getEvents().add(event);
+        }
     }
 
     private Stack getStackOrThrow(String stackNameOrArn, String region) {
