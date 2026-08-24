@@ -64,7 +64,6 @@ public class CloudFormationService {
     private Object getStackLock(String stackName, String region) {
         return stackLocks.computeIfAbsent(key(stackName, region), k -> new Object());
     }
-
     // Persisted state so stacks survive a restart (criteria #10, #11). The in-memory maps above are
     // the live working copy; these backends are write-through + loaded on startup. CloudFormation is
     // account-blind (keyed by stack+region), so everything is stored under one fixed account
@@ -363,9 +362,19 @@ public class CloudFormationService {
             Map<String, String> params =
                     cs.getParameters() != null ? cs.getParameters() : Map.of();
 
-            return executor.submit(() -> runUnderAccount(accountId, () -> {
-                executeTemplate(stack, templateBody, params, isCreate, region, accountId);
-            }));
+            return executor.submit(() -> {
+                synchronized (getStackLock(stackName, region)) {
+                    runUnderAccount(accountId, () -> {
+                        executeTemplate(
+                                stack,
+                                templateBody,
+                                params,
+                                isCreate,
+                                region,
+                                accountId);
+                    });
+                }
+            });
         }
     }
     /**
@@ -463,9 +472,13 @@ public class CloudFormationService {
 
             Stack stackToDelete = stack;
 
-            return executor.submit(() -> runUnderAccount(accountId, () -> {
-                deleteStackResources(stackToDelete, region);
-            }));
+            return executor.submit(() -> {
+                synchronized (getStackLock(stackName, region)) {
+                    runUnderAccount(accountId, () -> {
+                        deleteStackResources(stackToDelete, region);
+                    });
+                }
+            });
         }
     }
 
