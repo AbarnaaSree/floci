@@ -279,7 +279,9 @@ public class LambdaService {
             throw new AwsException("InvalidParameterValueException", "Runtime is required for Zip package type", 400);
         }
 
-        if (functionStore.get(region, functionName).isPresent()) {
+        String accountId = regionResolver.getAccountId();
+
+        if (functionStore.getForAccount(accountId, region, functionName).isPresent()) {
             throw new AwsException("ResourceConflictException",
                     "Function already exist: " + functionName, 409);
         }
@@ -644,7 +646,7 @@ public class LambdaService {
             if (concurrencyLimiter != null) {
                 concurrencyLimiter.reset(arn);
             }
-            codeStore.delete(functionName);
+            codeStore.delete(accountIdOf(fn), functionName);
             functionStore.delete(region, functionName);
             versionCounters.remove(region + "::" + functionName);
             if (aliasStore != null) {
@@ -982,7 +984,13 @@ public class LambdaService {
         }
         return new ScalingConfig((int) longValue);
     }
+    private static String accountIdOf(LambdaFunction fn) {
+        if (fn.getAccountId() != null && !fn.getAccountId().isBlank()) {
+            return fn.getAccountId();
+        }
 
+        return AwsArnUtils.accountOrDefault(fn.getFunctionArn(), "");
+    }
     private void startPollingHelper(EventSourceMapping esm) {
         if (esm.getEventSourceArn().contains(":sqs:")) {
             poller.startPolling(esm);
@@ -1549,7 +1557,8 @@ public class LambdaService {
     }
 
     private void extractZipCodeBytes(LambdaFunction fn, byte[] zipBytes, String region) {
-        Path codePath = codeStore.getCodePath(fn.getFunctionName());
+        String accountId = accountIdOf(fn);
+        Path codePath = codeStore.getCodePath(accountId, fn.getFunctionName());
         try {
             zipExtractor.extractTo(zipBytes, codePath);
             fn.setCodeLocalPath(codePath.toAbsolutePath().normalize().toString());

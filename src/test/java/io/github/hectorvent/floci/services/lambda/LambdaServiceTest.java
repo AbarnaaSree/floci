@@ -1,5 +1,5 @@
 package io.github.hectorvent.floci.services.lambda;
-
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -37,7 +37,10 @@ class LambdaServiceTest {
 
     @BeforeEach
     void setUp() {
-        LambdaFunctionStore store = new LambdaFunctionStore(new InMemoryStorage<String, LambdaFunction>());
+        LambdaFunctionStore store =
+            new LambdaFunctionStore(
+                    AccountAwareStorageBackend.inMemory("000000000000")
+            );
         WarmPool warmPool = new WarmPool();
         CodeStore codeStore = new CodeStore(Path.of("target/test-data/lambda-code"));
         ZipExtractor zipExtractor = new ZipExtractor();
@@ -54,6 +57,21 @@ class LambdaServiceTest {
                 "Timeout", 10,
                 "MemorySize", 256
         ));
+    }
+    private static String zipCode(String content) {
+        try {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+
+            try (ZipOutputStream zip = new ZipOutputStream(output)) {
+                zip.putNextEntry(new ZipEntry("index.js"));
+                zip.write(content.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                zip.closeEntry();
+            }
+
+            return Base64.getEncoder().encodeToString(output.toByteArray());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private static Map<String, Object> vpcConfig() {
@@ -884,5 +902,71 @@ class LambdaServiceTest {
                 .collect(java.util.stream.Collectors.toSet());
 
         assertEquals(expectedStatementIds, actualStatementIds);
+    }
+   @Test
+    void sameFunctionNameCanExistInDifferentAccounts() {
+        InMemoryStorage<String, LambdaFunction> storage = new InMemoryStorage<>();
+
+        LambdaFunctionStore accountOneStore =
+                new LambdaFunctionStore(
+                        new AccountAwareStorageBackend<>(
+                                storage,
+                                null,
+                                "111111111111"));
+
+        LambdaFunctionStore accountTwoStore =
+                new LambdaFunctionStore(
+                        new AccountAwareStorageBackend<>(
+                                storage,
+                                null,
+                                "222222222222"));
+
+        WarmPool warmPool = new WarmPool();
+        CodeStore codeStore =
+                new CodeStore(Path.of("target/test-data/lambda-code-cross-account"));
+        ZipExtractor zipExtractor = new ZipExtractor();
+
+        LambdaService accountOneService = new LambdaService(
+                accountOneStore,
+                warmPool,
+                codeStore,
+                zipExtractor,
+                new RegionResolver("us-east-1", "111111111111"));
+
+        LambdaService accountTwoService = new LambdaService(
+                accountTwoStore,
+                warmPool,
+                codeStore,
+                zipExtractor,
+                new RegionResolver("us-east-1", "222222222222"));
+
+        String functionName = "same-function";
+
+        Map<String, Object> firstRequest = baseRequest(functionName);
+        firstRequest.put("Code", Map.of("ZipFile", zipCode("account-one")));
+
+        Map<String, Object> secondRequest = baseRequest(functionName);
+        secondRequest.put("Code", Map.of("ZipFile", zipCode("account-two")));
+
+        LambdaFunction first =
+                accountOneService.createFunction(REGION, firstRequest);
+
+        LambdaFunction second =
+                accountTwoService.createFunction(REGION, secondRequest);
+
+        assertEquals(functionName, first.getFunctionName());
+        assertEquals(functionName, second.getFunctionName());
+
+        assertEquals("111111111111", first.getAccountId());
+        assertEquals("222222222222", second.getAccountId());
+
+        assertNotEquals(first.getFunctionArn(), second.getFunctionArn());
+        assertNotEquals(first.getCodeLocalPath(), second.getCodeLocalPath());
+
+        assertTrue(first.getCodeLocalPath().contains("111111111111"));
+        assertTrue(second.getCodeLocalPath().contains("222222222222"));
+        assertNotNull(first.getCodeLocalPath());
+        assertNotNull(second.getCodeLocalPath());
+
     }
 }

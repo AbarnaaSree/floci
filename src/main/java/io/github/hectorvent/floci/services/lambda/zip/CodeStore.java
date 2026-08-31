@@ -30,15 +30,18 @@ public class CodeStore {
         this.baseDir = baseDir;
     }
 
-    public Path getCodePath(String functionName) {
-        return baseDir.resolve(sanitizeName(functionName));
+    public Path getCodePath(String accountId, String functionName) {
+        return baseDir
+                .resolve(sanitizeName(accountId))
+                .resolve(sanitizeName(functionName));
     }
 
-    public void delete(String functionName) {
-        Path codePath = getCodePath(functionName);
+    public void delete(String accountId, String functionName) {
+        Path codePath = getCodePath(accountId, functionName);
         if (!Files.exists(codePath)) {
             return;
         }
+
         try {
             Files.walk(codePath)
                     .sorted(Comparator.reverseOrder())
@@ -51,12 +54,13 @@ public class CodeStore {
                     });
             LOG.debugv("Deleted code for function: {0}", functionName);
         } catch (IOException e) {
-            LOG.warnv("Failed to delete code directory for {0}: {1}", functionName, e.getMessage());
+            LOG.warnv("Failed to delete code directory for {0}: {1}",
+                    functionName, e.getMessage());
         }
     }
 
-    public boolean exists(String functionName) {
-        Path codePath = getCodePath(functionName);
+    public boolean exists(String accountId, String functionName) {
+        Path codePath = getCodePath(accountId, functionName);
         try {
             return Files.exists(codePath) && Files.list(codePath).findAny().isPresent();
         } catch (IOException e) {
