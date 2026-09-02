@@ -8,8 +8,8 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -27,6 +27,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
@@ -90,20 +92,40 @@ class CloudFormationIntegrationTest {
     }
 
     private static String physicalIdByLogicalId(String xml, String logicalId) {
-        String memberOpen = "<member>";
-        String memberClose = "</member>";
-        String logicalMarker = "<LogicalResourceId>" + logicalId + "</LogicalResourceId>";
-        int logicalIdx = xml.indexOf(logicalMarker);
-        assertThat("logical id '" + logicalId + "' present in DescribeStackResources output",
-                logicalIdx, not(equalTo(-1)));
-        int memberStart = xml.lastIndexOf(memberOpen, logicalIdx);
-        int memberEnd = xml.indexOf(memberClose, logicalIdx);
-        String member = xml.substring(memberStart, memberEnd);
-        String physicalOpen = "<PhysicalResourceId>";
-        String physicalClose = "</PhysicalResourceId>";
-        int pStart = member.indexOf(physicalOpen) + physicalOpen.length();
-        int pEnd = member.indexOf(physicalClose, pStart);
-        return member.substring(pStart, pEnd);
+        Pattern memberPattern = Pattern.compile(
+            "<member>(.*?)</member>",
+            Pattern.DOTALL
+        );
+        Pattern logicalPattern = Pattern.compile(
+            "<LogicalResourceId>\\s*" + Pattern.quote(logicalId) + "\\s*</LogicalResourceId>"
+        );
+        Pattern physicalPattern = Pattern.compile(
+            "<PhysicalResourceId>\\s*(.*?)\\s*</PhysicalResourceId>",
+            Pattern.DOTALL
+        );
+
+        Matcher members = memberPattern.matcher(xml);
+
+        while (members.find()) {
+            String member = members.group(1);
+
+            if (logicalPattern.matcher(member).find()) {
+                Matcher physical = physicalPattern.matcher(member);
+
+                assertThat(
+                    "physical id for logical id '" + logicalId + "' present",
+                    physical.find(),
+                    equalTo(true)
+                );
+
+                return physical.group(1).trim();
+            }
+        }
+
+        fail("logical id '" + logicalId
+                + "' present in DescribeStackResources output:\n" + xml);
+
+        return null;
     }
 
     @Test
@@ -467,6 +489,14 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        String physicalIdAfterCreate = given()
+            .when()
+                .get("/?Action=DescribeStackResources&StackName=" + stackName)
+            .then()
+                .statusCode(200)
+                .extract()
+                .xmlPath()
+                .getString("DescribeStackResourcesResponse.DescribeStackResourcesResult.StackResourceSummaries.member.PhysicalResourceId");
 
         given()
         .when()
@@ -485,6 +515,16 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        String physicalIdAfterUpdate = given()
+            .when()
+                .get("/?Action=DescribeStackResources&StackName=" + stackName)
+            .then()
+                .statusCode(200)
+                .extract()
+                .xmlPath()
+                .getString("DescribeStackResourcesResponse.DescribeStackResourcesResult.StackResourceSummaries.member.PhysicalResourceId");
+
+        assertEquals(physicalIdAfterCreate, physicalIdAfterUpdate);
 
         given()
         .when()
@@ -1465,7 +1505,6 @@ class CloudFormationIntegrationTest {
             .statusCode(200)
             .body(containsString("<StackId>"))
             .extract().asString();
-
         // Extract the ARN from the response
         String stackArn = createResponse.substring(
                 createResponse.indexOf("<StackId>") + "<StackId>".length(),
@@ -10624,6 +10663,83 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("FifoQueue"));
+    }
+    @Test
+    void updateStack_s3BucketWithUnrelatedResourceKeepsPhysicalId() {
+        String stackName = "cfn-ref-stability-stack";
+
+        String initialTemplate = """
+            {
+            "Resources": {
+                "Bkt": {
+                "Type": "AWS::S3::Bucket"
+                }
+            }
+            }
+            """;
+
+        String updatedTemplate = """
+            {
+            "Resources": {
+                "Bkt": {
+                "Type": "AWS::S3::Bucket"
+                },
+                "Q": {
+                "Type": "AWS::SQS::Queue"
+                }
+            }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", initialTemplate)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String resourcesXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract()
+            .asString();
+
+        String physicalIdAfterCreate =
+            physicalIdByLogicalId(resourcesXml, "Bkt");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", updatedTemplate)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String resourcesXmlAfterUpdate = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract()
+            .asString();
+
+        String physicalIdAfterUpdate =
+            physicalIdByLogicalId(resourcesXmlAfterUpdate, "Bkt");
+
+        assertEquals(physicalIdAfterCreate, physicalIdAfterUpdate);
     }
 
 }

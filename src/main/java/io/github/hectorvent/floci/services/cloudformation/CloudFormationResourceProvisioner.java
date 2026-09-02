@@ -665,17 +665,27 @@ public class CloudFormationResourceProvisioner {
 
     private void provisionS3Bucket(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
                                    String region, String accountId, String stackName) {
-        String bucketName = resolveOptional(props, "BucketName", engine);
+        String bucketName = r.getPhysicalId();
+
         if (bucketName == null || bucketName.isBlank()) {
-            bucketName = generatePhysicalName(stackName, r.getLogicalId(), 63, true);
+            bucketName = resolveOptional(props, "BucketName", engine);
+
+            if (bucketName == null || bucketName.isBlank()) {
+                bucketName = generatePhysicalName(stackName, r.getLogicalId(), 63, true);
+            }
+
+            s3Service.createBucket(bucketName, region);
         }
-        s3Service.createBucket(bucketName, region);
+
         applyBucketCorsConfiguration(bucketName, props, engine);
+
         r.setPhysicalId(bucketName);
         r.getAttributes().put("Arn", AwsArnUtils.Arn.of("s3", "", "", bucketName).toString());
         r.getAttributes().put("DomainName", bucketName + ".s3.amazonaws.com");
-        r.getAttributes().put("RegionalDomainName", bucketName + ".s3." + region + ".amazonaws.com");
-        r.getAttributes().put("WebsiteURL", "http://" + bucketName + ".s3-website." + region + ".amazonaws.com");
+        r.getAttributes().put("RegionalDomainName",
+                bucketName + ".s3." + region + ".amazonaws.com");
+        r.getAttributes().put("WebsiteURL",
+                "http://" + bucketName + ".s3-website." + region + ".amazonaws.com");
         r.getAttributes().put("BucketName", bucketName);
     }
 
