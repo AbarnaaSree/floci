@@ -94,6 +94,7 @@ public class DynamoDbService {
     private DynamoDbStreamService streamService;
     private KinesisStreamingForwarder kinesisForwarder;
     private S3Service s3Service;
+    private static final long MAX_DYNAMODB_LIST_INDEX = 4_294_967_294L;
 
     @Inject
     public DynamoDbService(StorageFactory storageFactory, RegionResolver regionResolver,
@@ -2102,39 +2103,69 @@ public class DynamoDbService {
     }
 
     // Tokenizes a DynamoDB path like "a.b[0].c" or "#l[5]" into a list of
-    // String (attr name) and Integer (list index) tokens.
+    // String (attr name) and Long (list index) tokens.
     private List<Object> parsePath(String path, JsonNode exprAttrNames) {
         List<Object> tokens = new ArrayList<>();
         for (String dotSeg : path.split("\\.")) {
             dotSeg = dotSeg.trim();
             if (dotSeg.isEmpty()) continue;
+
             int brk = dotSeg.indexOf('[');
             if (brk < 0) {
                 tokens.add(resolveAttributeName(dotSeg, exprAttrNames));
             } else {
                 String namePart = dotSeg.substring(0, brk);
-                if (!namePart.isEmpty()) tokens.add(resolveAttributeName(namePart, exprAttrNames));
+                if (!namePart.isEmpty()) {
+                    tokens.add(resolveAttributeName(namePart, exprAttrNames));
+                }
+
                 String rest = dotSeg.substring(brk);
                 int p = 0;
+
                 while (p < rest.length() && rest.charAt(p) == '[') {
                     int close = rest.indexOf(']', p);
                     if (close < 0) break;
-                    tokens.add(Integer.parseInt(rest.substring(p + 1, close)));
+
+                    String indexText = rest.substring(p + 1, close);
+
+                    final long index;
+                    try {
+                        index = Long.parseLong(indexText);
+                    } catch (NumberFormatException e) {
+                        throw new AwsException(
+                                "ValidationException",
+                                "Invalid list index: " + indexText,
+                                400);
+                    }
+
+                    if (index < 0 || index > MAX_DYNAMODB_LIST_INDEX) {
+                        throw new AwsException(
+                                "ValidationException",
+                                "1 validation error detected: Invalid UpdateExpression: "
+                                        + "List index is not within the allowable range; index: ["
+                                        + indexText
+                                        + "]. The maximum allowed index is 4294967294",
+                                400);
+                    }
+
+                    tokens.add(index);
                     p = close + 1;
                 }
             }
         }
         return tokens;
     }
+    // Sets an existing list element or appends the value when the index is past the end.
+    private void setOrAppend(
+            com.fasterxml.jackson.databind.node.ArrayNode arr,
+            long idx,
+            JsonNode value) {
 
-    // Pads arr with NULL elements up to idx-1, then sets/appends value at idx.
-    private void padAndSet(com.fasterxml.jackson.databind.node.ArrayNode arr, int idx, JsonNode value) {
-        com.fasterxml.jackson.databind.node.ObjectNode nullNode =
-                com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
-        nullNode.put("NULL", true);
-        while (arr.size() < idx) arr.add(nullNode.deepCopy());
-        if (idx < arr.size()) arr.set(idx, value);
-        else arr.add(value);
+        if (idx < arr.size()) {
+            arr.set((int) idx, value);
+        } else {
+            arr.add(value);
+        }
     }
 
     private void setValueAtPath(ObjectNode item, String path, JsonNode value, JsonNode exprAttrNames) {
@@ -2169,10 +2200,10 @@ public class DynamoDbService {
                         } else {
                             ((ObjectNode) child.get("M")).set(finalAttr, value);
                         }
-                    } else if (nextTok instanceof Integer finalIdx) {
+                    } else if (nextTok instanceof Long finalIdx) {
                         if (child == null || !child.has("L")) throw new AwsException("ValidationException",
                                 "The document path provided in the update expression is invalid for update", 400);
-                        padAndSet((com.fasterxml.jackson.databind.node.ArrayNode) child.get("L"), finalIdx, value);
+                        setOrAppend((com.fasterxml.jackson.databind.node.ArrayNode) child.get("L"), finalIdx, value);
                     }
                     return;
                 }
@@ -2189,25 +2220,25 @@ public class DynamoDbService {
                     } else {
                         container = child.get("M");
                     }
-                } else if (nextTok instanceof Integer) {
+                } else if (nextTok instanceof Long) {
                     if (child == null || !child.has("L")) throw new AwsException("ValidationException",
                             "The document path provided in the update expression is invalid for update", 400);
                     container = child.get("L");
                 }
-            } else if (tok instanceof Integer listIdx) {
+            } else if (tok instanceof Long listIdx) {
                 if (!(container instanceof com.fasterxml.jackson.databind.node.ArrayNode arr)) return;
                 if (listIdx >= arr.size()) throw new AwsException("ValidationException",
                         "The document path provided in the update expression is invalid for update", 400);
-                JsonNode element = arr.get(listIdx);
+                JsonNode element = arr.get(listIdx.intValue());
                 if (last) {
                     if (nextTok instanceof String finalAttr) {
                         if (!element.has("M")) throw new AwsException("ValidationException",
                                 "The document path provided in the update expression is invalid for update", 400);
                         ((ObjectNode) element.get("M")).set(finalAttr, value);
-                    } else if (nextTok instanceof Integer finalIdx) {
+                    } else if (nextTok instanceof Long finalIdx) {
                         if (!element.has("L")) throw new AwsException("ValidationException",
                                 "The document path provided in the update expression is invalid for update", 400);
-                        padAndSet((com.fasterxml.jackson.databind.node.ArrayNode) element.get("L"), finalIdx, value);
+                        setOrAppend((com.fasterxml.jackson.databind.node.ArrayNode) element.get("L"), finalIdx, value);
                     }
                     return;
                 }
@@ -2215,7 +2246,7 @@ public class DynamoDbService {
                     if (!element.has("M")) throw new AwsException("ValidationException",
                             "The document path provided in the update expression is invalid for update", 400);
                     container = element.get("M");
-                } else if (nextTok instanceof Integer) {
+                } else if (nextTok instanceof Long) {
                     if (!element.has("L")) throw new AwsException("ValidationException",
                             "The document path provided in the update expression is invalid for update", 400);
                     container = element.get("L");
@@ -2240,20 +2271,20 @@ public class DynamoDbService {
                 if (nextTok instanceof String) {
                     if (!child.has("M")) return null;
                     current = child.get("M");
-                } else if (nextTok instanceof Integer) {
+                } else if (nextTok instanceof Long) {
                     if (!child.has("L")) return null;
                     current = child.get("L");
                 } else return null;
-            } else if (tok instanceof Integer listIdx) {
+            } else if (tok instanceof Long listIdx) {
                 if (!current.isArray() || listIdx >= current.size()) return null;
-                JsonNode element = current.get(listIdx);
+                JsonNode element = current.get(listIdx.intValue());
                 if (element == null) return null;
                 if (isLast) return element;
                 Object nextTok = tokens.get(i + 1);
                 if (nextTok instanceof String) {
                     if (!element.has("M")) return null;
                     current = element.get("M");
-                } else if (nextTok instanceof Integer) {
+                } else if (nextTok instanceof Long) {
                     if (!element.has("L")) return null;
                     current = element.get("L");
                 } else return null;
@@ -2288,41 +2319,41 @@ public class DynamoDbService {
                     if (nextTok instanceof String finalAttr) {
                         if (child == null || !child.has("M")) return;
                         ((ObjectNode) child.get("M")).remove(finalAttr);
-                    } else if (nextTok instanceof Integer finalIdx) {
+                    } else if (nextTok instanceof Long finalIdx) {
                         if (child == null || !child.has("L")) return;
                         com.fasterxml.jackson.databind.node.ArrayNode lArr =
                                 (com.fasterxml.jackson.databind.node.ArrayNode) child.get("L");
-                        if (finalIdx < lArr.size()) lArr.remove(finalIdx);
+                        if (finalIdx < lArr.size()) lArr.remove(finalIdx.intValue());
                     }
                     return;
                 }
                 if (nextTok instanceof String) {
                     if (child == null || !child.has("M")) return;
                     container = child.get("M");
-                } else if (nextTok instanceof Integer) {
+                } else if (nextTok instanceof Long) {
                     if (child == null || !child.has("L")) return;
                     container = child.get("L");
                 }
-            } else if (tok instanceof Integer listIdx) {
+            } else if (tok instanceof Long listIdx) {
                 if (!(container instanceof com.fasterxml.jackson.databind.node.ArrayNode arr)) return;
                 if (listIdx >= arr.size()) return;
-                JsonNode element = arr.get(listIdx);
+                JsonNode element = arr.get(listIdx.intValue());
                 if (last) {
                     if (nextTok instanceof String finalAttr) {
                         if (!element.has("M")) return;
                         ((ObjectNode) element.get("M")).remove(finalAttr);
-                    } else if (nextTok instanceof Integer finalIdx) {
+                    } else if (nextTok instanceof Long finalIdx) {
                         if (!element.has("L")) return;
                         com.fasterxml.jackson.databind.node.ArrayNode lArr =
                                 (com.fasterxml.jackson.databind.node.ArrayNode) element.get("L");
-                        if (finalIdx < lArr.size()) lArr.remove(finalIdx);
+                        if (finalIdx < lArr.size()) lArr.remove(finalIdx.intValue());
                     }
                     return;
                 }
                 if (nextTok instanceof String) {
                     if (!element.has("M")) return;
                     container = element.get("M");
-                } else if (nextTok instanceof Integer) {
+                } else if (nextTok instanceof Long) {
                     if (!element.has("L")) return;
                     container = element.get("L");
                 }
